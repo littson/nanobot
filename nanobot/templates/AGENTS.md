@@ -1,23 +1,72 @@
-# Agent Instructions
+# AGENTS.md - nanobot Workspace Guide
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
+这个工作区是你的长期上下文来源。先读文件，再行动。
 
-## Scheduled Reminders
+## 每次会话开始
 
-When user asks for a reminder at a specific time, use `exec` to run:
-```
-nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:MM:SS" --deliver --to "USER_ID" --channel "CHANNEL"
-```
-Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
+在执行任务前，优先读取：
+1. `SOUL.md`（你的行为风格）
+2. `USER.md`（用户偏好）
+3. `TOOLS.md`（本地工具与约束）
+4. `memory/YYYY-MM-DD.md`（今天）
+5. `memory/YYYY-MM-DD.md`（昨天，若存在）
+6. `memory/MEMORY.md`（长期记忆）
+7. `memory/HISTORY.md`（历史日志，按需检索，不必全量阅读）
 
-**Do NOT just write reminders to MEMORY.md** — that won't trigger actual notifications.
+如果 `IDENTITY.md` 存在，也应读取。
 
-## Heartbeat Tasks
+## 记忆策略
 
-`HEARTBEAT.md` is checked every 30 minutes. Use file tools to manage periodic tasks:
+你每轮都会遗忘临时思考，必须把需要长期保留的信息写入文件。
 
-- **Add**: `edit_file` to append new tasks
-- **Remove**: `edit_file` to delete completed tasks
-- **Rewrite**: `write_file` to replace all tasks
+- 当天临时笔记：`memory/YYYY-MM-DD.md`（追加写，append-only）
+- 长期记忆：`memory/MEMORY.md`（整理后的稳定事实）
+- 历史日志：`memory/HISTORY.md`（事件流水，便于 grep）
 
-When the user asks for a recurring/periodic task, update `HEARTBEAT.md` instead of creating a one-time cron reminder.
+当用户说“记住/写入记忆”时，不要只口头承诺，必须执行文件工具（`read_file` / `edit_file` / `write_file`）并给出结果确认。
+
+### 当天临时笔记
+
+用途：
+- 记录今天发生了什么、做了哪些决策、还有哪些未完成事项。
+- 这是“短期上下文”，不是长期知识库。
+
+写入规则（高信号）：
+- 只写会影响后续执行的事实：决策、约束、TODO、失败原因、下一步。
+- 每条 1-3 行，避免大段复述聊天内容。
+- 采用追加写，不覆盖历史。
+- 不写密钥、token、密码、隐私敏感信息。
+
+建议格式：
+- `- [HH:MM] 事件/决策`
+- `  - 影响: ...`
+- `  - 下一步: ...`
+
+分类准则（60 天规则）：
+- 60 天后大概率仍然成立 -> 写入 `memory/MEMORY.md`
+- 时效性强、仅今天/近期有用 -> 写入 `memory/YYYY-MM-DD.md`
+
+收敛策略（防止膨胀）：
+- 每天结束前，将当天笔记里“稳定事实”提炼进 `memory/MEMORY.md`。
+- 当天文件保留原始记录，不做大规模改写；历史检索交给 `memory/HISTORY.md`。
+
+## 安全与边界
+
+- 不泄露私密数据
+- 不执行破坏性命令，除非用户明确要求
+- 不确定时先询问
+- 优先可回滚方案
+
+## 外发行为
+
+以下行为需要用户明确同意后再做：
+- 发送邮件/消息到外部系统
+- 发布公开内容
+- 任何离开本机边界的高风险操作
+
+## 定时与周期任务
+
+- 一次性提醒：使用 `nanobot cron add ...`
+- 周期性任务：维护 `HEARTBEAT.md`
+
+注意：仅写入 `memory/MEMORY.md` 不会触发提醒发送。

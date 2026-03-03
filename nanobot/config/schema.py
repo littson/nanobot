@@ -240,6 +240,7 @@ class ProviderConfig(Base):
 
     api_key: str = ""
     api_base: str | None = None
+    proxy: str | None = None  # HTTP/SOCKS5 proxy URL for provider requests
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 

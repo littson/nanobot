@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -12,6 +13,7 @@ from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.utils.llm_metrics import log_llm_metrics
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "nanobot"
@@ -20,19 +22,22 @@ DEFAULT_ORIGINATOR = "nanobot"
 class OpenAICodexProvider(LLMProvider):
     """Use Codex OAuth to call the Responses API."""
 
-    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex"):
+    def __init__(self, default_model: str = "openai-codex/gpt-5.1-codex", proxy: str | None = None):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
+        self.proxy = proxy
 
     async def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
     ) -> LLMResponse:
+        started = time.perf_counter()
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
 
@@ -48,29 +53,79 @@ class OpenAICodexProvider(LLMProvider):
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
 
         if tools:
             body["tools"] = _convert_tools(tools)
+            body["tool_choice"] = tool_choice
 
         url = DEFAULT_CODEX_URL
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url,
+                    headers,
+                    body,
+                    verify=True,
+                    proxy=self.proxy,
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
-            return LLMResponse(
+                content, tool_calls, finish_reason = await _request_codex(
+                    url,
+                    headers,
+                    body,
+                    verify=False,
+                    proxy=self.proxy,
+                )
+            response = LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
             )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            log_llm_metrics({
+                "provider": "openai_codex",
+                "model": model,
+                "resolved_model": _strip_model_prefix(model),
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "finish_reason": finish_reason,
+                "has_tools": bool(tools),
+                "tool_count": len(tools or []),
+                "message_count": len(messages),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "reasoning_effort": reasoning_effort,
+                "error": False,
+            })
+            return response
         except Exception as e:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            log_llm_metrics({
+                "provider": "openai_codex",
+                "model": model,
+                "resolved_model": _strip_model_prefix(model),
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "finish_reason": "error",
+                "has_tools": bool(tools),
+                "tool_count": len(tools or []),
+                "message_count": len(messages),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "reasoning_effort": reasoning_effort,
+                "error": True,
+                "error_message": str(e),
+            })
             return LLMResponse(
                 content=f"Error calling Codex: {str(e)}",
                 finish_reason="error",
@@ -103,8 +158,9 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    proxy: str | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
-    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+    async with httpx.AsyncClient(timeout=60.0, verify=verify, proxy=proxy) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()

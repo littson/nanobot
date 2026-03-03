@@ -139,11 +139,27 @@ class TelegramChannel(BaseChannel):
 
         self._running = True
 
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
-        if self.config.proxy:
-            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
+        # Build separate HTTP clients:
+        # - request: regular bot API calls
+        # - updates_req: long-polling getUpdates (more tolerant read timeout)
+        req = HTTPXRequest(
+            connection_pool_size=16,
+            pool_timeout=5.0,
+            connect_timeout=15.0,
+            read_timeout=20.0,
+            write_timeout=20.0,
+            media_write_timeout=30.0,
+            proxy=self.config.proxy or None,
+        )
+        updates_req = HTTPXRequest(
+            connection_pool_size=8,
+            pool_timeout=10.0,
+            connect_timeout=15.0,
+            read_timeout=35.0,
+            write_timeout=20.0,
+            proxy=self.config.proxy or None,
+        )
+        builder = Application.builder().token(self.config.token).request(req).get_updates_request(updates_req)
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
@@ -179,6 +195,8 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
+            timeout=25,  # long-poll timeout sent to Telegram
+            bootstrap_retries=-1,  # retry forever on startup/network flaps
             allowed_updates=["message"],
             drop_pending_updates=True  # Ignore old messages on startup
         )

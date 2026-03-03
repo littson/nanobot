@@ -1,10 +1,13 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import select
 import signal
 import sys
+from collections import defaultdict, deque
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -210,7 +213,10 @@ def _make_provider(config: Config):
 
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
+        return OpenAICodexProvider(
+            default_model=model,
+            proxy=p.proxy if p else None,
+        )
 
     # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
     if provider_name == "custom":
@@ -218,6 +224,17 @@ def _make_provider(config: Config):
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            proxy=p.proxy if p else None,
+        )
+
+    # Gemini + proxy: use Gemini OpenAI-compatible endpoint directly.
+    # This avoids LiteLLM/Gemini SOCKS instability in some environments.
+    if provider_name == "gemini" and p and p.proxy:
+        return CustomProvider(
+            api_key=p.api_key or "no-key",
+            api_base=config.get_api_base(model) or "https://generativelanguage.googleapis.com/v1beta/openai",
+            default_model=model,
+            proxy=p.proxy,
         )
 
     from nanobot.providers.registry import find_by_name
@@ -233,6 +250,7 @@ def _make_provider(config: Config):
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
+        proxy=p.proxy if p else None,
     )
 
 
@@ -1027,6 +1045,150 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+
+@app.command()
+def metrics(
+    tail: int = typer.Option(500, "--tail", min=1, help="Read the most recent N metric records"),
+    group_by: str = typer.Option("model", "--group-by", help="Group by 'model' or 'provider'"),
+    errors_only: bool = typer.Option(False, "--errors-only", help="Show only failed calls"),
+    from_time: str | None = typer.Option(None, "--from", help="Start time (ISO-8601, inclusive)"),
+    to_time: str | None = typer.Option(None, "--to", help="End time (ISO-8601, inclusive)"),
+    path: str | None = typer.Option(None, "--path", help="Override metrics jsonl path"),
+):
+    """Show LLM metrics summary from llm_metrics.jsonl."""
+    from nanobot.utils.llm_metrics import get_llm_metrics_path
+
+    group_by = group_by.strip().lower()
+    if group_by not in {"model", "provider"}:
+        console.print("[red]Error: --group-by must be 'model' or 'provider'[/red]")
+        raise typer.Exit(1)
+
+    def _parse_user_time(value: str | None, flag: str) -> datetime | None:
+        if not value:
+            return None
+        raw = value.strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            console.print(f"[red]Error: invalid {flag} time '{value}'. Use ISO-8601 format.[/red]")
+            raise typer.Exit(1) from None
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return dt
+
+    def _parse_record_time(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return dt
+
+    dt_from = _parse_user_time(from_time, "--from")
+    dt_to = _parse_user_time(to_time, "--to")
+    if dt_from and dt_to and dt_from > dt_to:
+        console.print("[red]Error: --from must be earlier than or equal to --to[/red]")
+        raise typer.Exit(1)
+
+    metrics_path = Path(path).expanduser() if path else get_llm_metrics_path()
+    if not metrics_path.exists():
+        console.print(f"[red]Metrics file not found:[/red] {metrics_path}")
+        raise typer.Exit(1)
+
+    rows: deque[dict] = deque(maxlen=tail)
+    with open(metrics_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if isinstance(rec, dict):
+                    rows.append(rec)
+            except json.JSONDecodeError:
+                continue
+
+    data = list(rows)
+    if dt_from or dt_to:
+        filtered: list[dict] = []
+        for r in data:
+            dt = _parse_record_time(r.get("timestamp"))
+            if dt is None:
+                continue
+            if dt_from and dt < dt_from:
+                continue
+            if dt_to and dt > dt_to:
+                continue
+            filtered.append(r)
+        data = filtered
+    if errors_only:
+        data = [r for r in data if r.get("error") is True]
+    if not data:
+        console.print("[yellow]No metrics records to display.[/yellow]")
+        return
+
+    total_calls = len(data)
+    total_errors = sum(1 for r in data if r.get("error") is True)
+    total_ms = sum(int(r.get("elapsed_ms") or 0) for r in data)
+    total_tokens = sum(int(r.get("total_tokens") or 0) for r in data)
+    prompt_tokens = sum(int(r.get("prompt_tokens") or 0) for r in data)
+    completion_tokens = sum(int(r.get("completion_tokens") or 0) for r in data)
+    avg_ms = total_ms / total_calls if total_calls else 0.0
+
+    console.print(f"{__logo__} LLM Metrics\n")
+    console.print(f"File: {metrics_path}")
+    console.print(
+        "Calls: {} | Errors: {} | Avg Latency: {:.1f} ms | Prompt Tokens: {} | Completion Tokens: {} | Total Tokens: {}".format(
+            total_calls, total_errors, avg_ms, prompt_tokens, completion_tokens, total_tokens
+        )
+    )
+
+    grouped: dict[str, dict[str, float]] = defaultdict(lambda: {
+        "calls": 0,
+        "errors": 0,
+        "elapsed_ms": 0.0,
+        "prompt_tokens": 0.0,
+        "completion_tokens": 0.0,
+        "total_tokens": 0.0,
+    })
+    key_field = "model" if group_by == "model" else "provider"
+    for r in data:
+        key = str(r.get(key_field) or "(unknown)")
+        bucket = grouped[key]
+        bucket["calls"] += 1
+        bucket["errors"] += 1 if r.get("error") is True else 0
+        bucket["elapsed_ms"] += float(r.get("elapsed_ms") or 0)
+        bucket["prompt_tokens"] += float(r.get("prompt_tokens") or 0)
+        bucket["completion_tokens"] += float(r.get("completion_tokens") or 0)
+        bucket["total_tokens"] += float(r.get("total_tokens") or 0)
+
+    table = Table(title=f"Grouped by {group_by}")
+    table.add_column("Key", style="cyan")
+    table.add_column("Calls", justify="right")
+    table.add_column("Errors", justify="right")
+    table.add_column("Avg ms", justify="right")
+    table.add_column("Prompt", justify="right")
+    table.add_column("Completion", justify="right")
+    table.add_column("Total", justify="right")
+
+    for key, m in sorted(grouped.items(), key=lambda kv: (kv[1]["total_tokens"], kv[1]["calls"]), reverse=True):
+        calls = int(m["calls"])
+        avg = (m["elapsed_ms"] / calls) if calls else 0.0
+        table.add_row(
+            key,
+            str(calls),
+            str(int(m["errors"])),
+            f"{avg:.1f}",
+            str(int(m["prompt_tokens"])),
+            str(int(m["completion_tokens"])),
+            str(int(m["total_tokens"])),
+        )
+    console.print()
+    console.print(table)
 
 
 # ============================================================================

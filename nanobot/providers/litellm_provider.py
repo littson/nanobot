@@ -1,16 +1,21 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import os
 import secrets
 import string
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 import json_repair
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
+from nanobot.utils.llm_metrics import log_llm_metrics
 
 # Standard OpenAI chat-completion message keys plus reasoning_content for
 # thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
@@ -38,10 +43,13 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        proxy: str | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self.proxy = self._normalize_proxy(proxy)
+        self._proxy_lock = asyncio.Lock()
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -114,6 +122,31 @@ class LiteLLMProvider(LLMProvider):
             return model
         return f"{canonical_prefix}/{remainder}"
 
+    @staticmethod
+    def _normalize_proxy(proxy: str | None) -> str | None:
+        """Normalize proxy URL for better cross-library compatibility."""
+        if not proxy:
+            return None
+        raw = proxy.strip()
+        if not raw:
+            return None
+        return raw
+
+    @staticmethod
+    def _is_retryable_connection_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        retry_signals = (
+            "server disconnected",
+            "remoteprotocolerror",
+            "apiconnectionerror",
+            "readerror",
+            "connection reset",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+        )
+        return any(signal in msg for signal in retry_signals)
+
     def _supports_cache_control(self, model: str) -> bool:
         """Return True when the provider supports cache_control on content blocks."""
         if self._gateway is not None:
@@ -173,6 +206,7 @@ class LiteLLMProvider(LLMProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
@@ -191,6 +225,7 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
+        started = time.perf_counter()
         original_model = model or self.default_model
         model = self._resolve_model(original_model)
 
@@ -229,17 +264,121 @@ class LiteLLMProvider(LLMProvider):
         
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice
 
         try:
-            response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            response = await self._acompletion_with_proxy(**kwargs)
+            parsed = self._parse_response(response)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            log_llm_metrics({
+                "provider": "litellm",
+                "provider_name": self._gateway.name if self._gateway else (find_by_model(original_model).name if find_by_model(original_model) else ""),
+                "model": original_model,
+                "resolved_model": model,
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": parsed.usage.get("prompt_tokens", 0),
+                "completion_tokens": parsed.usage.get("completion_tokens", 0),
+                "total_tokens": parsed.usage.get("total_tokens", 0),
+                "finish_reason": parsed.finish_reason,
+                "has_tools": bool(tools),
+                "tool_count": len(tools or []),
+                "message_count": len(messages),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "reasoning_effort": reasoning_effort,
+                "error": False,
+            })
+            return parsed
         except Exception as e:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            log_llm_metrics({
+                "provider": "litellm",
+                "provider_name": self._gateway.name if self._gateway else (find_by_model(original_model).name if find_by_model(original_model) else ""),
+                "model": original_model,
+                "resolved_model": model,
+                "elapsed_ms": elapsed_ms,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "finish_reason": "error",
+                "has_tools": bool(tools),
+                "tool_count": len(tools or []),
+                "message_count": len(messages),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "reasoning_effort": reasoning_effort,
+                "error": True,
+                "error_message": str(e),
+            })
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def _acompletion_with_proxy(self, **kwargs: Any):
+        """Run LiteLLM request with optional temporary proxy env vars."""
+        if not self.proxy:
+            return await acompletion(**kwargs)
+        parsed = urlparse(self.proxy)
+        is_socks = parsed.scheme.lower().startswith("socks")
+
+        # Some Gemini/LiteLLM paths only honor a subset of env vars.
+        # Try multiple env profiles in sequence.
+        profiles: list[tuple[str, tuple[str, ...]]] = []
+        if is_socks:
+            profiles = [
+                ("all_proxy_only", ("ALL_PROXY", "all_proxy")),
+                ("https_http", ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")),
+                ("all", ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")),
+            ]
+        else:
+            profiles = [
+                ("https_http", ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")),
+                ("all", ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")),
+            ]
+
+        attempts = 3
+        last_err: Exception | None = None
+        async with self._proxy_lock:
+            logger.info("LiteLLM request via proxy: {}", self.proxy)
+            for profile_name, proxy_keys in profiles:
+                prev_env = {k: os.environ.get(k) for k in proxy_keys}
+                try:
+                    for k in proxy_keys:
+                        os.environ[k] = self.proxy
+
+                    for i in range(attempts):
+                        try:
+                            return await acompletion(**kwargs)
+                        except Exception as e:
+                            last_err = e
+                            if i >= attempts - 1 or not self._is_retryable_connection_error(e):
+                                break
+                            backoff = 0.4 * (2 ** i)
+                            logger.warning(
+                                "LiteLLM connection error via proxy [{}] (attempt {}/{}): {}. Retrying in {:.1f}s",
+                                profile_name,
+                                i + 1,
+                                attempts,
+                                e,
+                                backoff,
+                            )
+                            await asyncio.sleep(backoff)
+                finally:
+                    for k, v in prev_env.items():
+                        if v is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = v
+
+                if last_err and not self._is_retryable_connection_error(last_err):
+                    raise last_err
+                logger.warning("LiteLLM proxy profile [{}] failed, trying next profile", profile_name)
+
+        if last_err:
+            raise last_err
+        raise RuntimeError("LiteLLM proxy request failed without specific exception")
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
