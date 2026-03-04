@@ -275,6 +275,7 @@ def _make_vertex_provider(provider_cfg: object, model: str):
             api_key=api_key,
             api_base=api_base,
             default_model=model,
+            provider_name="vertex",
             proxy=getattr(provider_cfg, "proxy", None),
             normalize_gemini_model_prefix=False,
         )
@@ -312,6 +313,7 @@ def _make_provider(config: Config):
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            provider_name="custom",
             proxy=p.proxy if p else None,
             normalize_gemini_model_prefix=False,
         )
@@ -337,6 +339,7 @@ def _make_provider(config: Config):
                 api_key=p.api_key or "no-key",
                 api_base=config.get_api_base(model) or "https://generativelanguage.googleapis.com/v1beta/openai",
                 default_model=model,
+                provider_name="gemini",
                 proxy=p.proxy,
                 normalize_gemini_model_prefix=True,
             )
@@ -956,7 +959,7 @@ def metrics(
     path: str | None = typer.Option(None, "--path", help="Override metrics jsonl path"),
 ):
     """Show LLM metrics summary from llm_metrics.jsonl."""
-    from nanobot.utils.llm_metrics import get_llm_metrics_path
+    from nanobot.utils.llm_metrics import get_llm_metrics_path, resolve_provider_name
 
     group_by = group_by.strip().lower()
     if group_by not in {"model", "provider"}:
@@ -1036,13 +1039,14 @@ def metrics(
     total_tokens = sum(int(r.get("total_tokens") or 0) for r in data)
     prompt_tokens = sum(int(r.get("prompt_tokens") or 0) for r in data)
     completion_tokens = sum(int(r.get("completion_tokens") or 0) for r in data)
+    cached_tokens = sum(int(r.get("cached_tokens") or 0) for r in data)
     avg_ms = total_ms / total_calls if total_calls else 0.0
 
     console.print(f"{__logo__} LLM Metrics\n")
     console.print(f"File: {metrics_path}")
     console.print(
-        "Calls: {} | Errors: {} | Avg Latency: {:.1f} ms | Prompt Tokens: {} | Completion Tokens: {} | Total Tokens: {}".format(
-            total_calls, total_errors, avg_ms, prompt_tokens, completion_tokens, total_tokens
+        "Calls: {} | Errors: {} | Avg Latency: {:.1f} ms | Prompt Tokens: {} | Cached Tokens: {} | Completion Tokens: {} | Total Tokens: {}".format(
+            total_calls, total_errors, avg_ms, prompt_tokens, cached_tokens, completion_tokens, total_tokens
         )
     )
 
@@ -1051,17 +1055,21 @@ def metrics(
         "errors": 0,
         "elapsed_ms": 0.0,
         "prompt_tokens": 0.0,
+        "cached_tokens": 0.0,
         "completion_tokens": 0.0,
         "total_tokens": 0.0,
     })
-    key_field = "model" if group_by == "model" else "provider"
     for r in data:
-        key = str(r.get(key_field) or "(unknown)")
+        if group_by == "model":
+            key = str(r.get("model") or "(unknown)")
+        else:
+            key = str(resolve_provider_name(r) or "(unknown)")
         bucket = grouped[key]
         bucket["calls"] += 1
         bucket["errors"] += 1 if r.get("error") is True else 0
         bucket["elapsed_ms"] += float(r.get("elapsed_ms") or 0)
         bucket["prompt_tokens"] += float(r.get("prompt_tokens") or 0)
+        bucket["cached_tokens"] += float(r.get("cached_tokens") or 0)
         bucket["completion_tokens"] += float(r.get("completion_tokens") or 0)
         bucket["total_tokens"] += float(r.get("total_tokens") or 0)
 
@@ -1071,6 +1079,7 @@ def metrics(
     table.add_column("Errors", justify="right")
     table.add_column("Avg ms", justify="right")
     table.add_column("Prompt", justify="right")
+    table.add_column("Cached", justify="right")
     table.add_column("Completion", justify="right")
     table.add_column("Total", justify="right")
 
@@ -1083,6 +1092,7 @@ def metrics(
             str(int(m["errors"])),
             f"{avg:.1f}",
             str(int(m["prompt_tokens"])),
+            str(int(m["cached_tokens"])),
             str(int(m["completion_tokens"])),
             str(int(m["total_tokens"])),
         )

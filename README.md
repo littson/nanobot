@@ -895,11 +895,23 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `nanobot agent --logs` | Show runtime logs during chat |
 | `nanobot gateway` | Start the gateway |
 | `nanobot status` | Show status |
+| `nanobot metrics` | Show LLM metrics summary |
 | `nanobot provider login openai-codex` | OAuth login for providers |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |
 
 Interactive mode exits: `exit`, `quit`, `/exit`, `/quit`, `:q`, or `Ctrl+D`.
+
+### `nanobot metrics` options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--tail` | `500` | Read the most recent N metrics records. |
+| `--group-by` | `model` | Group table by `model` or `provider`. |
+| `--errors-only` | `false` | Show only failed calls. |
+| `--from` | _none_ | Start time (ISO-8601, inclusive). |
+| `--to` | _none_ | End time (ISO-8601, inclusive). |
+| `--path` | _none_ | Override metrics JSONL file path. |
 
 <details>
 <summary><b>Heartbeat (Periodic Tasks)</b></summary>

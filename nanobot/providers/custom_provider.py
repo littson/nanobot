@@ -13,7 +13,7 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.utils.llm_metrics import log_llm_metrics
+from nanobot.utils.llm_metrics import extract_cached_tokens, log_llm_metrics
 
 
 class CustomProvider(LLMProvider):
@@ -26,10 +26,12 @@ class CustomProvider(LLMProvider):
         api_key: str = "no-key",
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
+        provider_name: str = "custom",
         proxy: str | None = None,
         normalize_gemini_model_prefix: bool = False,
     ):
         super().__init__(api_key, api_base)
+        self.provider_name = provider_name.strip().lower().replace("-", "_") or "custom"
         self._normalize_gemini_model_prefix = normalize_gemini_model_prefix
         self.default_model = self._resolve_model_name(default_model)
         http_client: httpx.AsyncClient | None = None
@@ -86,12 +88,14 @@ class CustomProvider(LLMProvider):
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 log_llm_metrics({
                     "provider": "custom",
+                    "provider_name": self.provider_name,
                     "model": requested_model,
                     "resolved_model": kwargs["model"],
                     "elapsed_ms": elapsed_ms,
                     "prompt_tokens": parsed.usage.get("prompt_tokens", 0),
                     "completion_tokens": parsed.usage.get("completion_tokens", 0),
                     "total_tokens": parsed.usage.get("total_tokens", 0),
+                    "cached_tokens": parsed.usage.get("cached_tokens", 0),
                     "finish_reason": parsed.finish_reason,
                     "has_tools": bool(tools),
                     "tool_count": len(tools or []),
@@ -108,12 +112,14 @@ class CustomProvider(LLMProvider):
                     elapsed_ms = int((time.perf_counter() - started) * 1000)
                     log_llm_metrics({
                         "provider": "custom",
+                        "provider_name": self.provider_name,
                         "model": requested_model,
                         "resolved_model": kwargs["model"],
                         "elapsed_ms": elapsed_ms,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
+                        "cached_tokens": 0,
                         "finish_reason": "error",
                         "has_tools": bool(tools),
                         "tool_count": len(tools or []),
@@ -139,12 +145,14 @@ class CustomProvider(LLMProvider):
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         log_llm_metrics({
             "provider": "custom",
+            "provider_name": self.provider_name,
             "model": requested_model,
             "resolved_model": kwargs["model"],
             "elapsed_ms": elapsed_ms,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
             "finish_reason": "error",
             "has_tools": bool(tools),
             "tool_count": len(tools or []),
@@ -187,7 +195,12 @@ class CustomProvider(LLMProvider):
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
-            usage={"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "total_tokens": u.total_tokens} if u else {},
+            usage={
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens,
+                "cached_tokens": extract_cached_tokens(u),
+            } if u else {},
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
 

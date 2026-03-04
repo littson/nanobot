@@ -13,7 +13,7 @@ import json_repair
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.utils.llm_metrics import log_llm_metrics
+from nanobot.utils.llm_metrics import extract_cached_tokens, log_llm_metrics
 
 
 class VertexNativeProvider(LLMProvider):
@@ -313,6 +313,7 @@ class VertexNativeProvider(LLMProvider):
             "prompt_tokens": int(usage_md.get("promptTokenCount", 0) or 0),
             "completion_tokens": int(usage_md.get("candidatesTokenCount", 0) or 0),
             "total_tokens": int(usage_md.get("totalTokenCount", 0) or 0),
+            "cached_tokens": extract_cached_tokens(usage_md),
         }
         return LLMResponse(
             content="".join(text_chunks) if text_chunks else None,
@@ -359,12 +360,14 @@ class VertexNativeProvider(LLMProvider):
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 log_llm_metrics({
                     "provider": "vertex_native",
+                    "provider_name": "vertex",
                     "model": requested_model,
                     "resolved_model": resolved_model,
                     "elapsed_ms": elapsed_ms,
                     "prompt_tokens": parsed.usage.get("prompt_tokens", 0),
                     "completion_tokens": parsed.usage.get("completion_tokens", 0),
                     "total_tokens": parsed.usage.get("total_tokens", 0),
+                    "cached_tokens": parsed.usage.get("cached_tokens", 0),
                     "finish_reason": parsed.finish_reason,
                     "has_tools": bool(tools),
                     "tool_count": len(tools or []),
@@ -381,12 +384,14 @@ class VertexNativeProvider(LLMProvider):
                     elapsed_ms = int((time.perf_counter() - started) * 1000)
                     log_llm_metrics({
                         "provider": "vertex_native",
+                        "provider_name": "vertex",
                         "model": requested_model,
                         "resolved_model": resolved_model,
                         "elapsed_ms": elapsed_ms,
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
                         "total_tokens": 0,
+                        "cached_tokens": 0,
                         "finish_reason": "error",
                         "has_tools": bool(tools),
                         "tool_count": len(tools or []),
@@ -412,12 +417,14 @@ class VertexNativeProvider(LLMProvider):
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         log_llm_metrics({
             "provider": "vertex_native",
+            "provider_name": "vertex",
             "model": requested_model,
             "resolved_model": resolved_model,
             "elapsed_ms": elapsed_ms,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
             "finish_reason": "error",
             "has_tools": bool(tools),
             "tool_count": len(tools or []),

@@ -15,7 +15,7 @@ from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
-from nanobot.utils.llm_metrics import log_llm_metrics
+from nanobot.utils.llm_metrics import extract_cached_tokens, log_llm_metrics
 
 # Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
@@ -289,6 +289,7 @@ class LiteLLMProvider(LLMProvider):
                 "prompt_tokens": parsed.usage.get("prompt_tokens", 0),
                 "completion_tokens": parsed.usage.get("completion_tokens", 0),
                 "total_tokens": parsed.usage.get("total_tokens", 0),
+                "cached_tokens": parsed.usage.get("cached_tokens", 0),
                 "finish_reason": parsed.finish_reason,
                 "has_tools": bool(tools),
                 "tool_count": len(tools or []),
@@ -310,6 +311,7 @@ class LiteLLMProvider(LLMProvider):
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
+                "cached_tokens": 0,
                 "finish_reason": "error",
                 "has_tools": bool(tools),
                 "tool_count": len(tools or []),
@@ -415,6 +417,7 @@ class LiteLLMProvider(LLMProvider):
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
+                "cached_tokens": extract_cached_tokens(response.usage),
             }
 
         reasoning_content = getattr(message, "reasoning_content", None) or None

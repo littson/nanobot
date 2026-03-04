@@ -1,3 +1,4 @@
+import json
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
+from nanobot.utils.llm_metrics import extract_cached_tokens, resolve_provider_name
 
 runner = CliRunner()
 
@@ -128,3 +130,79 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def test_resolve_provider_name_uses_explicit_name():
+    record = {
+        "provider": "custom",
+        "provider_name": "github-copilot",
+        "model": "github-copilot/gpt-5.3-codex",
+    }
+
+    assert resolve_provider_name(record) == "github_copilot"
+
+
+def test_resolve_provider_name_uses_model_before_backend():
+    record = {
+        "provider": "litellm",
+        "model": "openrouter/anthropic/claude-3.5-sonnet",
+    }
+
+    assert resolve_provider_name(record) == "openrouter"
+
+
+def test_resolve_provider_name_supports_vertex_alias():
+    record = {
+        "provider": "vertex_native",
+        "model": "google/gemini-2.5-flash",
+    }
+
+    assert resolve_provider_name(record) == "vertex"
+
+
+def test_extract_cached_tokens_from_nested_details():
+    usage = {"prompt_tokens_details": {"cached_tokens": 321}}
+
+    assert extract_cached_tokens(usage) == 321
+
+
+def test_extract_cached_tokens_from_vertex_usage_metadata():
+    usage = {"cachedContentTokenCount": 88}
+
+    assert extract_cached_tokens(usage) == 88
+
+
+def test_metrics_group_by_provider_prefers_provider_name(tmp_path: Path):
+    metrics_path = tmp_path / "llm_metrics.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-03-04T00:00:00+00:00",
+            "provider": "custom",
+            "provider_name": "vertex",
+            "model": "google/gemini-2.5-flash",
+            "elapsed_ms": 10,
+            "cached_tokens": 4,
+            "error": False,
+        },
+        {
+            "timestamp": "2026-03-04T00:01:00+00:00",
+            "provider": "vertex_native",
+            "provider_name": "vertex",
+            "model": "google/gemini-2.5-flash",
+            "elapsed_ms": 20,
+            "cached_tokens": 8,
+            "error": False,
+        },
+    ]
+    metrics_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["metrics", "--group-by", "provider", "--path", str(metrics_path), "--tail", "50"],
+    )
+
+    assert result.exit_code == 0
+    assert "Grouped by provider" in result.stdout
+    assert "vertex" in result.stdout
+    assert "vertex_native" not in result.stdout
+    assert "Cached Tokens: 12" in result.stdout
