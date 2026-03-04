@@ -18,7 +18,7 @@ from nanobot.utils.llm_metrics import log_llm_metrics
 
 class CustomProvider(LLMProvider):
     @staticmethod
-    def _normalize_model_name(model: str) -> str:
+    def _strip_gemini_prefix(model: str) -> str:
         return model.split("/", 1)[1] if model.startswith("gemini/") else model
 
     def __init__(
@@ -27,9 +27,11 @@ class CustomProvider(LLMProvider):
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
         proxy: str | None = None,
+        normalize_gemini_model_prefix: bool = False,
     ):
         super().__init__(api_key, api_base)
-        self.default_model = self._normalize_model_name(default_model)
+        self._normalize_gemini_model_prefix = normalize_gemini_model_prefix
+        self.default_model = self._resolve_model_name(default_model)
         http_client: httpx.AsyncClient | None = None
         if proxy:
             http_client = httpx.AsyncClient(
@@ -54,6 +56,11 @@ class CustomProvider(LLMProvider):
         )
         return any(s in msg for s in retry_signals)
 
+    def _resolve_model_name(self, model: str) -> str:
+        if self._normalize_gemini_model_prefix:
+            return self._strip_gemini_prefix(model)
+        return model
+
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    tool_choice: str = "auto",
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
@@ -61,7 +68,7 @@ class CustomProvider(LLMProvider):
         started = time.perf_counter()
         requested_model = model or self.default_model
         kwargs: dict[str, Any] = {
-            "model": self._normalize_model_name(requested_model),
+            "model": self._resolve_model_name(requested_model),
             "messages": self._sanitize_empty_content(messages),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,

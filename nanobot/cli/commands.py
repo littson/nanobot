@@ -201,6 +201,94 @@ def onboard():
 
 
 
+def _build_vertex_openai_api_base(project: str, location: str) -> str:
+    location = location.strip()
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+    return f"https://{host}/v1/projects/{project}/locations/{location}/endpoints/openapi"
+
+
+def _build_vertex_native_api_base(project: str, location: str) -> str:
+    location = location.strip()
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+    return f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models"
+
+
+def _build_vertex_express_native_api_base() -> str:
+    return "https://aiplatform.googleapis.com/v1/publishers/google/models"
+
+
+def _extract_vertex_project_location(provider_cfg: object) -> tuple[str, str]:
+    # Supports new vertex config keys (project/location) and old gemini keys
+    # (vertexProject/vertexLocation) for backward compatibility.
+    project = (
+        getattr(provider_cfg, "project", None)
+        or getattr(provider_cfg, "vertex_project", None)
+        or ""
+    )
+    location = (
+        getattr(provider_cfg, "location", None)
+        or getattr(provider_cfg, "vertex_location", None)
+        or "global"
+    )
+    return str(project).strip(), str(location).strip()
+
+
+def _make_vertex_provider(provider_cfg: object, model: str):
+    from nanobot.providers.custom_provider import CustomProvider
+    from nanobot.providers.vertex_native_provider import VertexNativeProvider
+
+    mode = (getattr(provider_cfg, "mode", "vertex_native") or "vertex_native").strip().lower()
+    api_key = (getattr(provider_cfg, "api_key", "") or "").strip()
+    if not api_key:
+        console.print("[red]Error: Missing Vertex credential.[/red]")
+        console.print("Set providers.vertex.apiKey in ~/.nanobot/config.json")
+        raise typer.Exit(1)
+
+    api_base = (getattr(provider_cfg, "api_base", None) or "").strip()
+    auth_mode = "oauth_bearer"
+    if not api_base:
+        project, location = _extract_vertex_project_location(provider_cfg)
+        if mode == "vertex_openai":
+            if not project:
+                console.print("[red]Error: Missing vertex project id.[/red]")
+                console.print("Set providers.vertex.project in ~/.nanobot/config.json")
+                raise typer.Exit(1)
+            api_base = _build_vertex_openai_api_base(project, location)
+        else:
+            # Vertex native supports two styles:
+            # 1) Standard mode: projects/{project}/locations/{location}/... + OAuth token
+            # 2) Express mode:  /v1/publishers/google/models/... + API key query param
+            if project:
+                api_base = _build_vertex_native_api_base(project, location)
+                auth_mode = "oauth_bearer"
+            else:
+                api_base = _build_vertex_express_native_api_base()
+                auth_mode = "api_key_query"
+    elif mode == "vertex_native":
+        normalized = api_base.lower()
+        # Auto-detect express endpoint when user sets apiBase manually.
+        if "/v1/publishers/google/models" in normalized and "/projects/" not in normalized:
+            auth_mode = "api_key_query"
+
+    if mode == "vertex_openai":
+        return CustomProvider(
+            api_key=api_key,
+            api_base=api_base,
+            default_model=model,
+            proxy=getattr(provider_cfg, "proxy", None),
+            normalize_gemini_model_prefix=False,
+        )
+
+    return VertexNativeProvider(
+        api_key=api_key,
+        api_base=api_base,
+        default_model=model,
+        proxy=getattr(provider_cfg, "proxy", None),
+        extra_headers=getattr(provider_cfg, "extra_headers", None),
+        auth_mode=auth_mode,
+    )
+
+
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
     from nanobot.providers.custom_provider import CustomProvider
@@ -225,17 +313,33 @@ def _make_provider(config: Config):
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
             proxy=p.proxy if p else None,
+            normalize_gemini_model_prefix=False,
         )
 
-    # Gemini + proxy: use Gemini OpenAI-compatible endpoint directly.
-    # This avoids LiteLLM/Gemini SOCKS instability in some environments.
-    if provider_name == "gemini" and p and p.proxy:
-        return CustomProvider(
-            api_key=p.api_key or "no-key",
-            api_base=config.get_api_base(model) or "https://generativelanguage.googleapis.com/v1beta/openai",
-            default_model=model,
-            proxy=p.proxy,
-        )
+    if provider_name == "vertex" and p:
+        return _make_vertex_provider(p, model)
+
+    if provider_name == "gemini" and p:
+        gemini_mode = (getattr(p, "mode", "gemini_api") or "gemini_api").strip().lower()
+
+        # Backward-compatibility: old config may set Vertex modes under gemini.
+        if gemini_mode in {"vertex_openai", "vertex_native"}:
+            console.print(
+                "[yellow]Warning:[/yellow] providers.gemini.mode=vertex_* is deprecated; "
+                "prefer providers.vertex with agents.defaults.provider=\"vertex\"."
+            )
+            return _make_vertex_provider(p, model)
+
+        # Gemini API + proxy: use Gemini OpenAI-compatible endpoint directly.
+        # This avoids LiteLLM/Gemini SOCKS instability in some environments.
+        if p.proxy:
+            return CustomProvider(
+                api_key=p.api_key or "no-key",
+                api_base=config.get_api_base(model) or "https://generativelanguage.googleapis.com/v1beta/openai",
+                default_model=model,
+                proxy=p.proxy,
+                normalize_gemini_model_prefix=True,
+            )
 
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)

@@ -245,6 +245,22 @@ class ProviderConfig(Base):
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
+class GeminiProviderConfig(ProviderConfig):
+    """Gemini provider configuration."""
+
+    mode: str = "gemini_api"  # gemini_api / vertex_openai / vertex_native
+    vertex_project: str | None = None
+    vertex_location: str = "global"
+
+
+class VertexProviderConfig(ProviderConfig):
+    """Vertex AI provider configuration."""
+
+    mode: str = "vertex_native"  # vertex_native / vertex_openai
+    project: str | None = None
+    location: str = "global"
+
+
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
@@ -257,7 +273,8 @@ class ProvidersConfig(Base):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # 阿里云通义千问
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    gemini: GeminiProviderConfig = Field(default_factory=GeminiProviderConfig)
+    vertex: VertexProviderConfig = Field(default_factory=VertexProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway

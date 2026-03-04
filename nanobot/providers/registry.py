@@ -272,6 +272,25 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
+    # Vertex AI: direct provider (native/OpenAI-compatible endpoints).
+    ProviderSpec(
+        name="vertex",
+        keywords=("vertex", "aiplatform"),
+        env_key="",
+        display_name="Vertex AI",
+        litellm_prefix="",
+        skip_prefixes=(),
+        env_extras=(),
+        is_gateway=False,
+        is_local=False,
+        detect_by_key_prefix="",
+        detect_by_base_keyword="aiplatform.googleapis.com",
+        default_api_base="",
+        strip_model_prefix=False,
+        model_overrides=(),
+        is_direct=True,
+    ),
+
     # Zhipu: LiteLLM uses "zai/" prefix.
     # Also mirrors key to ZHIPUAI_API_KEY (some LiteLLM paths check that).
     # skip_prefixes: don't add "zai/" when already routed via gateway.
