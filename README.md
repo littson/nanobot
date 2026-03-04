@@ -907,9 +907,9 @@ Interactive mode exits: `exit`, `quit`, `/exit`, `/quit`, `:q`, or `Ctrl+D`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--tail` | `500` | Read the most recent N metrics records. |
-| `--group-by` | `model` | Group table by `model` or `provider`. |
+| `--group-by` | `provider+model` | Group table by `provider+model`, `model`, or `provider` (daily rows). |
 | `--errors-only` | `false` | Show only failed calls. |
-| `--from` | _none_ | Start time (ISO-8601, inclusive). |
+| `--from` | _none_ | Start time (ISO-8601, inclusive). If omitted with default `--group-by`, metrics shows last 7 days by default. |
 | `--to` | _none_ | End time (ISO-8601, inclusive). |
 | `--path` | _none_ | Override metrics JSONL file path. |
 

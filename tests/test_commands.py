@@ -1,5 +1,6 @@
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -206,3 +207,47 @@ def test_metrics_group_by_provider_prefers_provider_name(tmp_path: Path):
     assert "vertex" in result.stdout
     assert "vertex_native" not in result.stdout
     assert "Cached Tokens: 12" in result.stdout
+
+
+def test_metrics_default_is_provider_model_daily_last_7_days(tmp_path: Path):
+    metrics_path = tmp_path / "llm_metrics.jsonl"
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "timestamp": (now - timedelta(days=1)).isoformat(),
+            "provider": "litellm",
+            "model": "openai/gpt-4.1-mini",
+            "elapsed_ms": 10,
+            "total_tokens": 11,
+            "error": False,
+        },
+        {
+            "timestamp": (now - timedelta(days=6)).isoformat(),
+            "provider": "litellm",
+            "model": "openai/gpt-4.1-nano",
+            "elapsed_ms": 20,
+            "total_tokens": 22,
+            "error": False,
+        },
+        {
+            "timestamp": (now - timedelta(days=8)).isoformat(),
+            "provider": "litellm",
+            "model": "openai/gpt-legacy",
+            "elapsed_ms": 30,
+            "total_tokens": 33,
+            "error": False,
+        },
+    ]
+    metrics_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["metrics", "--path", str(metrics_path), "--tail", "50"],
+    )
+
+    assert result.exit_code == 0
+    assert "Grouped by provider+model" in result.stdout
+    assert "default last 7 days" in result.stdout
+    assert "openai + openai/gpt-4.1-mini" in result.stdout
+    assert "openai + openai/gpt-4.1-nano" in result.stdout
+    assert "gpt-legacy" not in result.stdout

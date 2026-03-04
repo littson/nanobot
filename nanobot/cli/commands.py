@@ -7,7 +7,7 @@ import select
 import signal
 import sys
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -952,7 +952,11 @@ def status():
 @app.command()
 def metrics(
     tail: int = typer.Option(500, "--tail", min=1, help="Read the most recent N metric records"),
-    group_by: str = typer.Option("model", "--group-by", help="Group by 'model' or 'provider'"),
+    group_by: str = typer.Option(
+        "provider+model",
+        "--group-by",
+        help="Group by 'provider+model' (default), 'model', or 'provider'",
+    ),
     errors_only: bool = typer.Option(False, "--errors-only", help="Show only failed calls"),
     from_time: str | None = typer.Option(None, "--from", help="Start time (ISO-8601, inclusive)"),
     to_time: str | None = typer.Option(None, "--to", help="End time (ISO-8601, inclusive)"),
@@ -961,9 +965,18 @@ def metrics(
     """Show LLM metrics summary from llm_metrics.jsonl."""
     from nanobot.utils.llm_metrics import get_llm_metrics_path, resolve_provider_name
 
-    group_by = group_by.strip().lower()
-    if group_by not in {"model", "provider"}:
-        console.print("[red]Error: --group-by must be 'model' or 'provider'[/red]")
+    group_by_key = group_by.strip().lower()
+    group_by_aliases = {
+        "provider+model": "provider_model",
+        "provider_model": "provider_model",
+        "provider-model": "provider_model",
+        "providermodel": "provider_model",
+        "model": "model",
+        "provider": "provider",
+    }
+    group_by = group_by_aliases.get(group_by_key, "")
+    if not group_by:
+        console.print("[red]Error: --group-by must be one of 'provider+model', 'model', or 'provider'[/red]")
         raise typer.Exit(1)
 
     def _parse_user_time(value: str | None, flag: str) -> datetime | None:
@@ -992,6 +1005,12 @@ def metrics(
 
     dt_from = _parse_user_time(from_time, "--from")
     dt_to = _parse_user_time(to_time, "--to")
+    default_window_applied = False
+    if not dt_from and not dt_to and group_by == "provider_model":
+        now_local = datetime.now().astimezone()
+        dt_from = (now_local - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_to = now_local
+        default_window_applied = True
     if dt_from and dt_to and dt_from > dt_to:
         console.print("[red]Error: --from must be earlier than or equal to --to[/red]")
         raise typer.Exit(1)
@@ -1014,43 +1033,46 @@ def metrics(
             except json.JSONDecodeError:
                 continue
 
-    data = list(rows)
-    if dt_from or dt_to:
-        filtered: list[dict] = []
-        for r in data:
-            dt = _parse_record_time(r.get("timestamp"))
-            if dt is None:
-                continue
-            if dt_from and dt < dt_from:
-                continue
-            if dt_to and dt > dt_to:
-                continue
-            filtered.append(r)
-        data = filtered
-    if errors_only:
-        data = [r for r in data if r.get("error") is True]
+    filtered_data: list[tuple[dict, datetime | None]] = []
+    for r in rows:
+        dt = _parse_record_time(r.get("timestamp"))
+        if (dt_from or dt_to) and dt is None:
+            continue
+        if dt_from and dt and dt < dt_from:
+            continue
+        if dt_to and dt and dt > dt_to:
+            continue
+        if errors_only and r.get("error") is not True:
+            continue
+        filtered_data.append((r, dt.astimezone() if dt else None))
+    data = filtered_data
     if not data:
         console.print("[yellow]No metrics records to display.[/yellow]")
         return
 
     total_calls = len(data)
-    total_errors = sum(1 for r in data if r.get("error") is True)
-    total_ms = sum(int(r.get("elapsed_ms") or 0) for r in data)
-    total_tokens = sum(int(r.get("total_tokens") or 0) for r in data)
-    prompt_tokens = sum(int(r.get("prompt_tokens") or 0) for r in data)
-    completion_tokens = sum(int(r.get("completion_tokens") or 0) for r in data)
-    cached_tokens = sum(int(r.get("cached_tokens") or 0) for r in data)
+    total_errors = sum(1 for r, _ in data if r.get("error") is True)
+    total_ms = sum(int(r.get("elapsed_ms") or 0) for r, _ in data)
+    total_tokens = sum(int(r.get("total_tokens") or 0) for r, _ in data)
+    prompt_tokens = sum(int(r.get("prompt_tokens") or 0) for r, _ in data)
+    completion_tokens = sum(int(r.get("completion_tokens") or 0) for r, _ in data)
+    cached_tokens = sum(int(r.get("cached_tokens") or 0) for r, _ in data)
     avg_ms = total_ms / total_calls if total_calls else 0.0
 
     console.print(f"{__logo__} LLM Metrics\n")
     console.print(f"File: {metrics_path}")
+    if dt_from or dt_to:
+        range_text = f"{dt_from.isoformat() if dt_from else '-inf'} -> {dt_to.isoformat() if dt_to else '+inf'}"
+        if default_window_applied:
+            range_text += " (default last 7 days)"
+        console.print(f"Window: {range_text}")
     console.print(
         "Calls: {} | Errors: {} | Avg Latency: {:.1f} ms | Prompt Tokens: {} | Cached Tokens: {} | Completion Tokens: {} | Total Tokens: {}".format(
             total_calls, total_errors, avg_ms, prompt_tokens, cached_tokens, completion_tokens, total_tokens
         )
     )
 
-    grouped: dict[str, dict[str, float]] = defaultdict(lambda: {
+    grouped: dict[tuple[str, str], dict[str, float]] = defaultdict(lambda: {
         "calls": 0,
         "errors": 0,
         "elapsed_ms": 0.0,
@@ -1059,12 +1081,17 @@ def metrics(
         "completion_tokens": 0.0,
         "total_tokens": 0.0,
     })
-    for r in data:
+    for r, dt in data:
+        day_key = dt.date().isoformat() if dt else "(unknown)"
         if group_by == "model":
             key = str(r.get("model") or "(unknown)")
-        else:
+        elif group_by == "provider":
             key = str(resolve_provider_name(r) or "(unknown)")
-        bucket = grouped[key]
+        else:
+            provider = str(resolve_provider_name(r) or "(unknown)")
+            model = str(r.get("model") or "(unknown)")
+            key = f"{provider} + {model}"
+        bucket = grouped[(day_key, key)]
         bucket["calls"] += 1
         bucket["errors"] += 1 if r.get("error") is True else 0
         bucket["elapsed_ms"] += float(r.get("elapsed_ms") or 0)
@@ -1073,7 +1100,13 @@ def metrics(
         bucket["completion_tokens"] += float(r.get("completion_tokens") or 0)
         bucket["total_tokens"] += float(r.get("total_tokens") or 0)
 
-    table = Table(title=f"Grouped by {group_by}")
+    group_by_label = {
+        "model": "model",
+        "provider": "provider",
+        "provider_model": "provider+model",
+    }[group_by]
+    table = Table(title=f"Grouped by {group_by_label} (daily)")
+    table.add_column("Date", style="magenta")
     table.add_column("Key", style="cyan")
     table.add_column("Calls", justify="right")
     table.add_column("Errors", justify="right")
@@ -1083,10 +1116,15 @@ def metrics(
     table.add_column("Completion", justify="right")
     table.add_column("Total", justify="right")
 
-    for key, m in sorted(grouped.items(), key=lambda kv: (kv[1]["total_tokens"], kv[1]["calls"]), reverse=True):
+    for (day_key, key), m in sorted(
+        grouped.items(),
+        key=lambda kv: (kv[0][0], kv[1]["total_tokens"], kv[1]["calls"]),
+        reverse=True,
+    ):
         calls = int(m["calls"])
         avg = (m["elapsed_ms"] / calls) if calls else 0.0
         table.add_row(
+            day_key,
             key,
             str(calls),
             str(int(m["errors"])),
