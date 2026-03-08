@@ -1,6 +1,7 @@
 """LiteLLM provider implementation for multi-provider support."""
 
 import asyncio
+import json
 import os
 import secrets
 import string
@@ -211,6 +212,29 @@ class LiteLLMProvider(LLMProvider):
             sanitized.append(clean)
         return sanitized
 
+    @staticmethod
+    def _debug_message_roles(messages: list[dict[str, Any]]) -> list[str]:
+        """Build compact role trace for upstream role-validation debugging."""
+        role_trace: list[str] = []
+        for idx, msg in enumerate(messages):
+            role = str(msg.get("role", "<missing>"))
+            flags: list[str] = []
+            if msg.get("tool_calls"):
+                flags.append("tool_calls")
+            if msg.get("tool_call_id"):
+                flags.append("tool_call_id")
+            suffix = f" ({','.join(flags)})" if flags else ""
+            role_trace.append(f"{idx}:{role}{suffix}")
+        return role_trace
+
+    @staticmethod
+    def _debug_messages_json(messages: list[dict[str, Any]]) -> str:
+        """Serialize request messages for direct upstream debugging."""
+        try:
+            return json.dumps(messages, ensure_ascii=False, separators=(",", ":"), default=str)
+        except Exception:
+            return str(messages)
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -246,9 +270,11 @@ class LiteLLMProvider(LLMProvider):
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
 
+        sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys)
+
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
+            "messages": sanitized_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
@@ -301,6 +327,17 @@ class LiteLLMProvider(LLMProvider):
             })
             return parsed
         except Exception as e:
+            is_gemini_request = "gemini" in model.lower() or "gemini" in original_model.lower()
+            role_trace = self._debug_message_roles(sanitized_messages) if is_gemini_request else []
+            messages_json = self._debug_messages_json(sanitized_messages) if is_gemini_request else ""
+            if is_gemini_request:
+                logger.warning(
+                    "Gemini request failed. model={} roles_sent={} messages_sent_json={} error={}",
+                    model,
+                    role_trace,
+                    messages_json,
+                    e,
+                )
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             log_llm_metrics({
                 "provider": "litellm",
@@ -323,8 +360,11 @@ class LiteLLMProvider(LLMProvider):
                 "error_message": str(e),
             })
             # Return error as content for graceful handling
+            error_text = f"Error calling LLM: {str(e)}"
+            if is_gemini_request:
+                error_text = f"{error_text}\nroles_sent={role_trace}\nmessages_sent_json={messages_json}"
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=error_text,
                 finish_reason="error",
             )
 

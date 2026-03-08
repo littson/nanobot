@@ -1,0 +1,29 @@
+{
+  "name": "playwright-scraper-skill",
+  "version": "1.2.1",
+  "description": "Playwright web scraping skill with hardened defaults",
+  "main": "scripts/playwright-stealth.js",
+  "scripts": {
+    "ensure-runtime": "bash scripts/ensure-runtime.sh",
+    "simple": "node scripts/playwright-simple.js",
+    "stealth": "node scripts/playwright-stealth.js",
+    "simple-ready": "bash scripts/ensure-runtime.sh && node scripts/playwright-simple.js",
+    "stealth-ready": "bash scripts/ensure-runtime.sh && node scripts/playwright-stealth.js",
+    "test": "bash test.sh"
+  },
+  "keywords": [
+    "scraper",
+    "playwright",
+    "puppeteer",
+    "cloudflare",
+    "anti-detection"
+  ],
+  "author": "Simon Chan",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}

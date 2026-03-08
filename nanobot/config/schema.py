@@ -249,6 +249,7 @@ class GeminiProviderConfig(ProviderConfig):
     """Gemini provider configuration."""
 
     mode: str = "gemini_api"  # gemini_api / vertex_openai / vertex_native
+    gemini_native: bool = False  # If true, use Gemini native generateContent API (functionCall/functionResponse)
     vertex_project: str | None = None
     vertex_location: str = "global"
 

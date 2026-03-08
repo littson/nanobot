@@ -49,6 +49,9 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
+# Force LiteLLM to use local model cost map to avoid GitHub fetch timeout warnings.
+export LITELLM_LOCAL_MODEL_COST_MAP=true
+
 # Ensure single instance: stop existing "nanobot gateway" processes first.
 CURRENT_PID="$$"
 mapfile -t OLD_PIDS < <(pgrep -f "nanobot gateway" | grep -v "^${CURRENT_PID}$" || true)

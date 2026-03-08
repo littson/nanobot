@@ -60,7 +60,7 @@ class VertexNativeProvider(LLMProvider):
 
     def _build_url(self, model: str) -> str:
         base = (self.api_base or "").rstrip("/")
-        if base.endswith(":generateContent"):
+        if base.lower().endswith(":generatecontent"):
             return base
         return f"{base}/{model}:generateContent"
 

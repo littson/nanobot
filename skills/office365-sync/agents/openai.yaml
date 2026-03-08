@@ -1,0 +1,4 @@
+interface:
+  display_name: "Office365 Sync"
+  short_description: "Send mail and manage calendar/todo via O365"
+  default_prompt: "Use this skill to send Office365 mail and manage calendar/todo with conflict checks, safe lookup before update/delete, on-demand queries only, and cron-based token health checks."

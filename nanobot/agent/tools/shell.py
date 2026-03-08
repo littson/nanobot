@@ -88,14 +88,11 @@ class ExecTool(Tool):
                     timeout=self.timeout
                 )
             except asyncio.TimeoutError:
-                process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await self._cleanup_process(process)
                 return f"Error: Command timed out after {self.timeout} seconds"
+            except asyncio.CancelledError:
+                await self._cleanup_process(process)
+                raise
             
             output_parts = []
             
@@ -121,6 +118,24 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    async def _cleanup_process(self, process: asyncio.subprocess.Process) -> None:
+        """Ensure subprocess is terminated and reaped after timeout/cancel."""
+        if process.returncode is not None:
+            return
+
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+            return
+        except (ProcessLookupError, asyncio.TimeoutError):
+            pass
+
+        try:
+            process.kill()
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            pass
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

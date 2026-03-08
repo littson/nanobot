@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -109,7 +110,8 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
-        self._processing_lock = asyncio.Lock()
+        self._active_task_meta: dict[asyncio.Task, dict[str, Any]] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -268,16 +270,35 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
-            if msg.content.strip().lower() == "/stop":
+            cmd = msg.content.strip().lower()
+            if cmd == "/stop":
                 await self._handle_stop(msg)
+            elif cmd == "/status":
+                await self._handle_status(msg)
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+                self._active_task_meta[task] = {
+                    "started_at": time.monotonic(),
+                    "preview": preview,
+                }
+                task.add_done_callback(lambda t, k=msg.session_key: self._cleanup_active_task(k, t))
+
+    def _cleanup_active_task(self, session_key: str, task: asyncio.Task) -> None:
+        """Remove completed/cancelled task from active tracking."""
+        tasks = self._active_tasks.get(session_key, [])
+        if task in tasks:
+            tasks.remove(task)
+        if not tasks:
+            self._active_tasks.pop(session_key, None)
+        self._active_task_meta.pop(task, None)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
         tasks = self._active_tasks.pop(msg.session_key, [])
+        for task in tasks:
+            self._active_task_meta.pop(task, None)
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
             try:
@@ -291,9 +312,31 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
 
+    async def _handle_status(self, msg: InboundMessage) -> None:
+        """Report currently running tasks in this session."""
+        tasks = [t for t in self._active_tasks.get(msg.session_key, []) if not t.done()]
+        if not tasks:
+            content = "No active task in this session."
+        else:
+            now = time.monotonic()
+            lines = [f"Running task(s): {len(tasks)}"]
+            for idx, task in enumerate(tasks, start=1):
+                meta = self._active_task_meta.get(task, {})
+                started_at = float(meta.get("started_at", now))
+                elapsed = max(0, int(now - started_at))
+                preview = str(meta.get("preview", "")).strip() or "(no preview)"
+                lines.append(f"{idx}. {elapsed}s - {preview}")
+            lines.append("Use /stop to cancel.")
+            content = "\n".join(lines)
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=content,
+        ))
+
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        async with self._processing_lock:
+        """Process a message under a per-session lock."""
+        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        async with lock:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
@@ -391,7 +434,23 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/status — Show running tasks in this session\n/help — Show available commands")
+        if cmd == "/status":
+            tasks = [t for t in self._active_tasks.get(msg.session_key, []) if not t.done()]
+            if not tasks:
+                content = "No active task in this session."
+            else:
+                now = time.monotonic()
+                lines = [f"Running task(s): {len(tasks)}"]
+                for idx, task in enumerate(tasks, start=1):
+                    meta = self._active_task_meta.get(task, {})
+                    started_at = float(meta.get("started_at", now))
+                    elapsed = max(0, int(now - started_at))
+                    preview = str(meta.get("preview", "")).strip() or "(no preview)"
+                    lines.append(f"{idx}. {elapsed}s - {preview}")
+                lines.append("Use /stop to cancel.")
+                content = "\n".join(lines)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):

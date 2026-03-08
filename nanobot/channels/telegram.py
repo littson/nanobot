@@ -6,7 +6,14 @@ import asyncio
 import re
 
 from loguru import logger
-from telegram import BotCommand, ReplyParameters, Update
+from telegram import (
+    BotCommand,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    ReplyParameters,
+    Update,
+)
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -107,12 +114,14 @@ class TelegramChannel(BaseChannel):
     """
 
     name = "telegram"
+    CAPTION_MAX_LEN = 1024
 
     # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
+        BotCommand("status", "Show running tasks"),
         BotCommand("help", "Show available commands"),
     ]
 
@@ -166,6 +175,8 @@ class TelegramChannel(BaseChannel):
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
         self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("stop", self._forward_command))
+        self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
 
         # Add message handler for text, photos, voice, documents
@@ -260,34 +271,102 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
-        # Send media files
-        for media_path in (msg.media or []):
-            try:
-                media_type = self._get_media_type(media_path)
-                sender = {
-                    "photo": self._app.bot.send_photo,
-                    "voice": self._app.bot.send_voice,
-                    "audio": self._app.bot.send_audio,
-                }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
-                with open(media_path, 'rb') as f:
-                    await sender(
-                        chat_id=chat_id,
-                        **{param: f},
-                        reply_parameters=reply_params
-                    )
-            except Exception as e:
-                filename = media_path.rsplit("/", 1)[-1]
-                logger.error("Failed to send media {}: {}", media_path, e)
-                await self._app.bot.send_message(
+        media_paths = list(msg.media or [])
+        media_types = [self._get_media_type(path) for path in media_paths]
+        content = msg.content if msg.content and msg.content != "[empty message]" else ""
+        content_sent_as_caption = False
+
+        def _make_batches(items: list[str], size: int = 10) -> list[list[str]]:
+            batches = [items[i:i + size] for i in range(0, len(items), size)]
+            # sendMediaGroup requires each batch length >= 2
+            if len(batches) >= 2 and len(batches[-1]) == 1:
+                batches[-2].append(batches[-1][0])
+                batches.pop()
+            return batches
+
+        def _can_send_media_group(types: list[str]) -> bool:
+            # Keep grouping rules strict to avoid Telegram API rejections.
+            if len(types) < 2:
+                return False
+            if any(t == "voice" for t in types):
+                return False
+            return len(set(types)) == 1 and types[0] in {"photo", "audio", "document"}
+
+        async def _send_single_media(media_path: str) -> None:
+            media_type = self._get_media_type(media_path)
+            sender = {
+                "photo": self._app.bot.send_photo,
+                "voice": self._app.bot.send_voice,
+                "audio": self._app.bot.send_audio,
+            }.get(media_type, self._app.bot.send_document)
+            param = (
+                "photo"
+                if media_type == "photo"
+                else media_type if media_type in ("voice", "audio") else "document"
+            )
+            with open(media_path, "rb") as f:
+                await sender(
                     chat_id=chat_id,
-                    text=f"[Failed to send: {filename}]",
-                    reply_parameters=reply_params
+                    **{param: f},
+                    reply_parameters=reply_params,
                 )
 
-        # Send text content
-        if msg.content and msg.content != "[empty message]":
-            for chunk in _split_message(msg.content):
+        grouped_sent = False
+        if media_paths and _can_send_media_group(media_types):
+            batches = _make_batches(media_paths, size=10)
+            if all(len(batch) >= 2 for batch in batches):
+                try:
+                    caption = ""
+                    if content:
+                        caption = _split_message(content, max_len=self.CAPTION_MAX_LEN)[0]
+                    for batch_idx, batch in enumerate(batches):
+                        media_group = []
+                        for i, media_path in enumerate(batch):
+                            caption_kwargs = {}
+                            if batch_idx == 0 and i == 0 and caption:
+                                caption_kwargs["caption"] = caption
+                            with open(media_path, "rb") as f:
+                                if media_types[0] == "photo":
+                                    media_item = InputMediaPhoto(media=f.read(), **caption_kwargs)
+                                elif media_types[0] == "audio":
+                                    media_item = InputMediaAudio(media=f.read(), **caption_kwargs)
+                                else:
+                                    media_item = InputMediaDocument(media=f.read(), **caption_kwargs)
+                            media_group.append(media_item)
+
+                        await self._app.bot.send_media_group(
+                            chat_id=chat_id,
+                            media=media_group,
+                            reply_parameters=reply_params if batch_idx == 0 else None,
+                        )
+                    grouped_sent = True
+                    content_sent_as_caption = bool(caption)
+                except Exception as e:
+                    logger.warning("send_media_group failed, fallback to single sends: {}", e)
+
+        # Fallback: send media files one by one.
+        if media_paths and not grouped_sent:
+            for media_path in media_paths:
+                try:
+                    await _send_single_media(media_path)
+                except Exception as e:
+                    filename = media_path.rsplit("/", 1)[-1]
+                    logger.error("Failed to send media {}: {}", media_path, e)
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"[Failed to send: {filename}]",
+                        reply_parameters=reply_params
+                    )
+
+        # Send text content (or caption remainder).
+        if content:
+            remaining = content
+            if content_sent_as_caption:
+                chunks = _split_message(content, max_len=self.CAPTION_MAX_LEN)
+                remaining = "\n".join(chunks[1:]).strip() if len(chunks) > 1 else ""
+            if not remaining:
+                return
+            for chunk in _split_message(remaining):
                 try:
                     html = _markdown_to_telegram_html(chunk)
                     await self._app.bot.send_message(
@@ -327,6 +406,7 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
+            "/status — Show running tasks in this session\n"
             "/help — Show available commands"
         )
 
@@ -421,8 +501,6 @@ class TelegramChannel(BaseChannel):
                 content_parts.append(f"[{media_type}: download failed]")
 
         content = "\n".join(content_parts) if content_parts else "[empty message]"
-
-        logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
 

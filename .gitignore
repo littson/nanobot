@@ -20,3 +20,10 @@ poetry.lock
 .pytest_cache/
 botpy.log
 tests/
+.venv-office365-sync/
+
+# Skill workspace artifacts
+skills/*/node_modules/
+skills/*/.state/
+skills/*/screenshot-*.png
+.DS_Store

@@ -23,11 +23,15 @@ class ChannelManager:
     - Route outbound messages
     """
 
+    STARTUP_MAX_ATTEMPTS = 3
+    STARTUP_RETRY_DELAY_S = 2.0
+
     def __init__(self, config: Config, bus: MessageBus):
         self.config = config
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._stopping = False
 
         self._init_channels()
 
@@ -160,17 +164,58 @@ class ChannelManager:
                 )
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
-        """Start a channel and log any exceptions."""
-        try:
-            await channel.start()
-        except Exception as e:
-            logger.error("Failed to start channel {}: {}", name, e)
+        """Start a channel with retry and isolate failures."""
+        for attempt in range(1, self.STARTUP_MAX_ATTEMPTS + 1):
+            if self._stopping:
+                return
+            try:
+                await channel.start()
+                if not self._stopping and not channel.is_running:
+                    logger.warning(
+                        "Channel {} exited without entering running state; disabling it",
+                        name,
+                    )
+                    self.channels.pop(name, None)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Some channels flip _running=True before network bootstrap.
+                # Ensure failed startup does not leave stale running state.
+                setattr(channel, "_running", False)
+                try:
+                    await channel.stop()
+                except Exception as stop_err:
+                    logger.debug("Error while stopping failed channel {}: {}", name, stop_err)
+
+                if attempt < self.STARTUP_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Failed to start channel {} (attempt {}/{}): {}. Retrying in {}s",
+                        name,
+                        attempt,
+                        self.STARTUP_MAX_ATTEMPTS,
+                        e,
+                        self.STARTUP_RETRY_DELAY_S,
+                    )
+                    await asyncio.sleep(self.STARTUP_RETRY_DELAY_S)
+                    continue
+
+                logger.error(
+                    "Failed to start channel {} after {} attempts: {}",
+                    name,
+                    self.STARTUP_MAX_ATTEMPTS,
+                    e,
+                )
+                self.channels.pop(name, None)
+                return
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
         if not self.channels:
             logger.warning("No channels enabled")
             return
+
+        self._stopping = False
 
         # Start outbound dispatcher
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
@@ -187,6 +232,7 @@ class ChannelManager:
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
+        self._stopping = True
 
         # Stop dispatcher
         if self._dispatch_task:
@@ -197,7 +243,7 @@ class ChannelManager:
                 pass
 
         # Stop all channels
-        for name, channel in self.channels.items():
+        for name, channel in list(self.channels.items()):
             try:
                 await channel.stop()
                 logger.info("Stopped {} channel", name)

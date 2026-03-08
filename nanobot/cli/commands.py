@@ -217,6 +217,60 @@ def _build_vertex_express_native_api_base() -> str:
     return "https://aiplatform.googleapis.com/v1/publishers/google/models"
 
 
+def _normalize_gemini_openai_api_base(api_base: str | None) -> str | None:
+    """Normalize Gemini OpenAI-compatible apiBase.
+
+    OpenAI-compatible Gemini endpoints are typically under `/v1beta/openai`.
+    Some deployments expose only `/v1beta`; append `/openai` in that case.
+    """
+    if not api_base:
+        return None
+    base = api_base.strip().rstrip("/")
+    lowered = base.lower()
+    if "/openai" in lowered:
+        return base
+    if "/v1beta" in lowered or "/v1alpha" in lowered:
+        return f"{base}/openai"
+    return base
+
+
+def _normalize_gemini_native_api_base(api_base: str | None) -> str | None:
+    """Normalize Gemini native generateContent apiBase.
+
+    Native Gemini endpoints are typically under `/v1beta/models`.
+    Some deployments expose only `/v1beta`; append `/models` in that case.
+    """
+    if not api_base:
+        return None
+    base = api_base.strip().rstrip("/")
+    lowered = base.lower()
+    # If user accidentally points to an OpenAI-compatible subpath, strip it.
+    openai_idx = lowered.find("/openai")
+    if openai_idx >= 0:
+        base = base[:openai_idx].rstrip("/")
+        lowered = base.lower()
+    if lowered.endswith(":generatecontent"):
+        return base
+    if "/models" in lowered:
+        return base
+    if "/v1beta" in lowered or "/v1alpha" in lowered:
+        return f"{base}/models"
+    return base
+
+
+def _gemini_native_auth_mode(api_key: str, api_base: str | None) -> str:
+    """Best-effort auth mode for Gemini native endpoints.
+
+    - AI Studio keys (`AIza...`) usually use `?key=...` query auth.
+    - OpenAI-style gateway keys (`sk-...`) usually use Bearer auth.
+    """
+    key = (api_key or "").strip()
+    base = (api_base or "").lower()
+    if key.startswith("AIza") or "generativelanguage.googleapis.com" in base:
+        return "api_key_query"
+    return "oauth_bearer"
+
+
 def _extract_vertex_project_location(provider_cfg: object) -> tuple[str, str]:
     # Supports new vertex config keys (project/location) and old gemini keys
     # (vertexProject/vertexLocation) for backward compatibility.
@@ -295,10 +349,27 @@ def _make_provider(config: Config):
     from nanobot.providers.custom_provider import CustomProvider
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+    from nanobot.providers.vertex_native_provider import VertexNativeProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
+    forced_provider = (config.agents.defaults.provider or "auto").strip().lower()
+
+    # Safety override: when Gemini native is explicitly enabled and model looks
+    # like Gemini, force Gemini provider selection in auto mode.
+    gemini_cfg = getattr(config.providers, "gemini", None)
+    gemini_native_enabled = bool(getattr(gemini_cfg, "gemini_native", False))
+    model_lower = model.lower()
+    if (
+        gemini_native_enabled
+        and "gemini" in model_lower
+        and forced_provider in {"", "auto", "gemini"}
+        and gemini_cfg is not None
+        and getattr(gemini_cfg, "api_key", "")
+    ):
+        provider_name = "gemini"
+        p = gemini_cfg
 
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
@@ -332,12 +403,38 @@ def _make_provider(config: Config):
             )
             return _make_vertex_provider(p, model)
 
-        # Gemini API + proxy: use Gemini OpenAI-compatible endpoint directly.
-        # This avoids LiteLLM/Gemini SOCKS instability in some environments.
-        if p.proxy:
+        raw_gemini_api_base = config.get_api_base(model)
+        lowered_base = (raw_gemini_api_base or "").lower()
+        gemini_native = bool(getattr(p, "gemini_native", False))
+
+        # Explicit native mode: Gemini generateContent API
+        # (functionCall/functionResponse), not OpenAI chat-completions format.
+        if gemini_native:
+            gemini_native_base = _normalize_gemini_native_api_base(raw_gemini_api_base)
+            return VertexNativeProvider(
+                api_key=p.api_key or "no-key",
+                api_base=gemini_native_base or "https://generativelanguage.googleapis.com/v1beta/models",
+                default_model=model,
+                proxy=p.proxy,
+                extra_headers=p.extra_headers,
+                auth_mode=_gemini_native_auth_mode(p.api_key or "", raw_gemini_api_base),
+            )
+
+        if raw_gemini_api_base and "/openai" not in lowered_base:
+            console.print(
+                "[yellow]Warning:[/yellow] providers.gemini.apiBase looks like a Gemini native endpoint, "
+                "but providers.gemini.geminiNative is false. "
+                "Set [cyan]providers.gemini.geminiNative=true[/cyan] to use native functionCall/functionResponse."
+            )
+
+        # OpenAI-compatible mode for Gemini:
+        # - custom OpenAI-compatible apiBase (contains /openai), or
+        # - proxy case where we prefer direct OpenAI-compatible Gemini endpoint.
+        if p.proxy or (raw_gemini_api_base and "/openai" in lowered_base):
+            gemini_openai_base = _normalize_gemini_openai_api_base(raw_gemini_api_base)
             return CustomProvider(
                 api_key=p.api_key or "no-key",
-                api_base=config.get_api_base(model) or "https://generativelanguage.googleapis.com/v1beta/openai",
+                api_base=gemini_openai_base or "https://generativelanguage.googleapis.com/v1beta/openai",
                 default_model=model,
                 provider_name="gemini",
                 proxy=p.proxy,
