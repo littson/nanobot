@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -41,7 +42,12 @@ class CustomProvider(LLMProvider):
                 timeout=60.0,
                 limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
             )
-        self._client = AsyncOpenAI(api_key=api_key, base_url=api_base, http_client=http_client)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=api_base,
+            http_client=http_client,
+            default_headers={"x-session-affinity": uuid.uuid4().hex},
+        )
 
     @staticmethod
     def _is_retryable_connection_error(exc: Exception) -> bool:
