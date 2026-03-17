@@ -86,6 +86,41 @@ class TestMessageToolSuppressLogic:
         assert result is not None
         assert "Hello" in result.content
 
+    @pytest.mark.asyncio
+    async def test_message_tool_uses_current_turn_thread_context(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1", name="message",
+            arguments={"content": "Hello"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        msg = InboundMessage(
+            channel="telegram",
+            sender_id="user1",
+            chat_id="-100123",
+            content="send",
+            metadata={"message_id": 10, "message_thread_id": 42},
+        )
+        await loop._process_message(msg)
+
+        loop.tools.execute.assert_any_call(
+            "message",
+            {
+                "content": "Hello",
+                "channel": "telegram",
+                "chat_id": "-100123",
+                "message_id": 10,
+                "message_thread_id": 42,
+            },
+        )
+
     async def test_progress_hides_internal_reasoning(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})

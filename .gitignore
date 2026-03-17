@@ -27,3 +27,4 @@ skills/*/node_modules/
 skills/*/.state/
 skills/*/screenshot-*.png
 .DS_Store
+uv.lock

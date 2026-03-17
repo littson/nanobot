@@ -1,5 +1,6 @@
 """Message tool for sending messages to users."""
 
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
@@ -14,19 +15,39 @@ class MessageTool(Tool):
         send_callback: Callable[[OutboundMessage], Awaitable[None]] | None = None,
         default_channel: str = "",
         default_chat_id: str = "",
-        default_message_id: str | None = None,
+        default_message_id: str | int | None = None,
+        default_message_thread_id: int | None = None,
     ):
         self._send_callback = send_callback
-        self._default_channel = default_channel
-        self._default_chat_id = default_chat_id
-        self._default_message_id = default_message_id
-        self._sent_in_turn: bool = False
+        self._default_channel = ContextVar("message_tool_default_channel", default=default_channel)
+        self._default_chat_id = ContextVar("message_tool_default_chat_id", default=default_chat_id)
+        self._default_message_id = ContextVar("message_tool_default_message_id", default=default_message_id)
+        self._default_message_thread_id = ContextVar(
+            "message_tool_default_message_thread_id",
+            default=default_message_thread_id,
+        )
+        self._sent_in_turn_var = ContextVar("message_tool_sent_in_turn", default=False)
 
-    def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    @property
+    def _sent_in_turn(self) -> bool:
+        return bool(self._sent_in_turn_var.get())
+
+    @_sent_in_turn.setter
+    def _sent_in_turn(self, value: bool) -> None:
+        self._sent_in_turn_var.set(bool(value))
+
+    def set_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | int | None = None,
+        message_thread_id: int | None = None,
+    ) -> None:
         """Set the current message context."""
-        self._default_channel = channel
-        self._default_chat_id = chat_id
-        self._default_message_id = message_id
+        self._default_channel.set(channel)
+        self._default_chat_id.set(chat_id)
+        self._default_message_id.set(message_id)
+        self._default_message_thread_id.set(message_thread_id)
 
     def set_send_callback(self, callback: Callable[[OutboundMessage], Awaitable[None]]) -> None:
         """Set the callback for sending messages."""
@@ -34,7 +55,7 @@ class MessageTool(Tool):
 
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
-        self._sent_in_turn = False
+        self._sent_in_turn_var.set(False)
 
     @property
     def name(self) -> str:
@@ -65,6 +86,10 @@ class MessageTool(Tool):
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional: list of file paths to attach (images, audio, documents)"
+                },
+                "message_thread_id": {
+                    "type": "integer",
+                    "description": "Optional internal Telegram topic id for routing replies"
                 }
             },
             "required": ["content"]
@@ -75,13 +100,15 @@ class MessageTool(Tool):
         content: str,
         channel: str | None = None,
         chat_id: str | None = None,
-        message_id: str | None = None,
+        message_id: str | int | None = None,
+        message_thread_id: int | None = None,
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
-        channel = channel or self._default_channel
-        chat_id = chat_id or self._default_chat_id
-        message_id = message_id or self._default_message_id
+        channel = channel or self._default_channel.get()
+        chat_id = chat_id or self._default_chat_id.get()
+        message_id = message_id or self._default_message_id.get()
+        message_thread_id = message_thread_id or self._default_message_thread_id.get()
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"
@@ -96,13 +123,14 @@ class MessageTool(Tool):
             media=media or [],
             metadata={
                 "message_id": message_id,
+                "message_thread_id": message_thread_id,
             },
         )
 
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
-                self._sent_in_turn = True
+            if channel == self._default_channel.get() and chat_id == self._default_chat_id.get():
+                self._sent_in_turn_var.set(True)
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:

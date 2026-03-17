@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import re
 import time
 import unicodedata
@@ -331,13 +332,59 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             logger.error("Invalid chat_id: {}", msg.chat_id)
             return
+
+        def _as_int(value: object) -> int | None:
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+            return None
+
         reply_to_message_id = msg.metadata.get("message_id")
-        message_thread_id = msg.metadata.get("message_thread_id")
-        if message_thread_id is None and reply_to_message_id is not None:
-            message_thread_id = self._message_threads.get((msg.chat_id, reply_to_message_id))
+        reply_to_message_id_int = _as_int(reply_to_message_id)
+        message_thread_id = _as_int(msg.metadata.get("message_thread_id"))
+        cached_thread_id = (
+            self._message_threads.get((msg.chat_id, reply_to_message_id_int))
+            if reply_to_message_id_int is not None
+            else None
+        )
+        if cached_thread_id is not None and message_thread_id != cached_thread_id:
+            logger.debug(
+                "Using cached message_thread_id {} over metadata {} for chat {}",
+                cached_thread_id,
+                message_thread_id,
+                chat_id,
+            )
+            message_thread_id = cached_thread_id
+        if message_thread_id is None:
+            message_thread_id = cached_thread_id
         thread_kwargs = {}
         if message_thread_id is not None:
             thread_kwargs["message_thread_id"] = message_thread_id
+
+        def _is_thread_not_found_error(exc: Exception) -> bool:
+            return "Message thread not found" in str(exc)
+
+        async def _call_with_thread_fallback(func, /, **kwargs):
+            """Retry once without topic routing when Telegram rejects thread id."""
+            try:
+                return await func(**kwargs, **thread_kwargs)
+            except Exception as e:
+                if thread_kwargs and _is_thread_not_found_error(e):
+                    if cached_thread_id is not None and thread_kwargs.get("message_thread_id") != cached_thread_id:
+                        logger.warning(
+                            "Invalid message_thread_id {} for chat {}, retrying with cached thread {}: {}",
+                            thread_kwargs.get("message_thread_id"),
+                            chat_id,
+                            cached_thread_id,
+                            e,
+                        )
+                        thread_kwargs["message_thread_id"] = cached_thread_id
+                        return await func(**kwargs, **thread_kwargs)
+                    logger.warning("Invalid message_thread_id for chat {}, retrying without thread: {}", chat_id, e)
+                    thread_kwargs.clear()
+                    return await func(**kwargs)
+                raise
 
         reply_params = None
         if self.config.reply_to_message:
@@ -348,9 +395,39 @@ class TelegramChannel(BaseChannel):
                 )
 
         media_paths = list(msg.media or [])
+        invalid_media: list[str] = []
+        valid_media: list[str] = []
+        for media_path in media_paths:
+            try:
+                path = Path(media_path)
+                if not path.is_file():
+                    invalid_media.append(media_path)
+                    logger.warning("Skip missing media file: {}", media_path)
+                    continue
+                if path.stat().st_size <= 0:
+                    invalid_media.append(media_path)
+                    logger.warning("Skip empty media file: {}", media_path)
+                    continue
+                valid_media.append(media_path)
+            except OSError as e:
+                invalid_media.append(media_path)
+                logger.warning("Skip unreadable media file {}: {}", media_path, e)
+        media_paths = valid_media
+
         media_types = [self._get_media_type(path) for path in media_paths]
         content = msg.content if msg.content and msg.content != "[empty message]" else ""
         content_sent_as_caption = False
+
+        if not media_paths and invalid_media and not content:
+            failed = ", ".join(Path(p).name for p in invalid_media[:3])
+            suffix = "..." if len(invalid_media) > 3 else ""
+            await _call_with_thread_fallback(
+                self._app.bot.send_message,
+                chat_id=chat_id,
+                text=f"[Attachment unavailable: {failed}{suffix}]",
+                reply_parameters=reply_params,
+            )
+            return
 
         def _make_batches(items: list[str], size: int = 10) -> list[list[str]]:
             batches = [items[i:i + size] for i in range(0, len(items), size)]
@@ -381,11 +458,11 @@ class TelegramChannel(BaseChannel):
                 else media_type if media_type in ("voice", "audio") else "document"
             )
             with open(media_path, "rb") as f:
-                await sender(
+                await _call_with_thread_fallback(
+                    sender,
                     chat_id=chat_id,
                     **{param: f},
                     reply_parameters=reply_params,
-                    **thread_kwargs,
                 )
 
         grouped_sent = False
@@ -411,11 +488,11 @@ class TelegramChannel(BaseChannel):
                                     media_item = InputMediaDocument(media=f.read(), **caption_kwargs)
                             media_group.append(media_item)
 
-                        await self._app.bot.send_media_group(
+                        await _call_with_thread_fallback(
+                            self._app.bot.send_media_group,
                             chat_id=chat_id,
                             media=media_group,
                             reply_parameters=reply_params if batch_idx == 0 else None,
-                            **thread_kwargs,
                         )
                     grouped_sent = True
                     content_sent_as_caption = bool(caption)
@@ -430,11 +507,11 @@ class TelegramChannel(BaseChannel):
                 except Exception as e:
                     filename = media_path.rsplit("/", 1)[-1]
                     logger.error("Failed to send media {}: {}", media_path, e)
-                    await self._app.bot.send_message(
+                    await _call_with_thread_fallback(
+                        self._app.bot.send_message,
                         chat_id=chat_id,
                         text=f"[Failed to send: {filename}]",
                         reply_parameters=reply_params,
-                        **thread_kwargs,
                     )
 
         # Send text content (or caption remainder).
@@ -447,11 +524,22 @@ class TelegramChannel(BaseChannel):
                 return
             is_progress = msg.metadata.get("_progress", False)
             for chunk in split_message(remaining, TELEGRAM_MAX_MESSAGE_LEN):
-                # Final response: simulate streaming via draft, then persist
-                if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
-                else:
-                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                try:
+                    # Final response: simulate streaming via draft, then persist
+                    if not is_progress:
+                        await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                    else:
+                        await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                except Exception as e:
+                    if thread_kwargs and _is_thread_not_found_error(e):
+                        logger.warning("Invalid message_thread_id for chat {}, retry text without thread: {}", chat_id, e)
+                        thread_kwargs.clear()
+                        if not is_progress:
+                            await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                        else:
+                            await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                    else:
+                        raise
 
     async def _send_text(
         self,

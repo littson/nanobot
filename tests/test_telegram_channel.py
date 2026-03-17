@@ -27,6 +27,7 @@ class _FakeUpdater:
 class _FakeBot:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
+        self.sent_media: list[dict] = []
 
     async def get_me(self):
         return SimpleNamespace(username="nanobot_test")
@@ -36,6 +37,9 @@ class _FakeBot:
 
     async def send_message(self, **kwargs) -> None:
         self.sent_messages.append(kwargs)
+
+    async def send_photo(self, **kwargs) -> None:
+        self.sent_media.append(kwargs)
 
 
 class _FakeApp:
@@ -182,3 +186,85 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+@pytest.mark.asyncio
+async def test_send_media_retries_without_invalid_thread_id(tmp_path) -> None:
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    app = _FakeApp(lambda: None)
+    channel._app = app
+
+    media_path = tmp_path / "img.png"
+    media_path.write_bytes(b"fake-png")
+
+    calls = {"send_photo": 0}
+
+    async def _flaky_send_photo(**kwargs):
+        calls["send_photo"] += 1
+        if "message_thread_id" in kwargs:
+            raise Exception("Message thread not found")
+        app.bot.sent_media.append(kwargs)
+
+    app.bot.send_photo = _flaky_send_photo
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="",
+            media=[str(media_path)],
+            metadata={"message_thread_id": 42},
+        )
+    )
+
+    assert calls["send_photo"] == 2
+    assert len(app.bot.sent_media) == 1
+    assert "message_thread_id" not in app.bot.sent_media[0]
+
+
+@pytest.mark.asyncio
+async def test_send_skips_empty_media_file_and_sends_text_only(tmp_path) -> None:
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    app = _FakeApp(lambda: None)
+    channel._app = app
+
+    media_path = tmp_path / "empty.png"
+    media_path.write_bytes(b"")
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            media=[str(media_path)],
+            metadata={"message_thread_id": 42},
+        )
+    )
+
+    assert len(app.bot.sent_media) == 0
+    assert len(app.bot.sent_messages) == 1
+    assert app.bot.sent_messages[0]["text"] == "hello"
+    assert app.bot.sent_messages[0]["message_thread_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_send_prefers_cached_thread_for_reply_message() -> None:
+    config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
+    channel = TelegramChannel(config, MessageBus())
+    app = _FakeApp(lambda: None)
+    channel._app = app
+    channel._message_threads[("123", 10)] = 42
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            metadata={"message_id": 10, "message_thread_id": 999},
+        )
+    )
+
+    assert len(app.bot.sent_messages) == 1
+    assert app.bot.sent_messages[0]["message_thread_id"] == 42
