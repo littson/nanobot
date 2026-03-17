@@ -30,11 +30,17 @@ class CustomProvider(LLMProvider):
         provider_name: str = "custom",
         proxy: str | None = None,
         normalize_gemini_model_prefix: bool = False,
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.provider_name = provider_name.strip().lower().replace("-", "_") or "custom"
         self._normalize_gemini_model_prefix = normalize_gemini_model_prefix
         self.default_model = self._resolve_model_name(default_model)
+
+        default_headers = {
+            "x-session-affinity": uuid.uuid4().hex,
+            **(extra_headers or {}),
+        }
         http_client: httpx.AsyncClient | None = None
         if proxy:
             http_client = httpx.AsyncClient(
@@ -42,11 +48,12 @@ class CustomProvider(LLMProvider):
                 timeout=60.0,
                 limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
             )
+
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=api_base,
+            default_headers=default_headers,
             http_client=http_client,
-            default_headers={"x-session-affinity": uuid.uuid4().hex},
         )
 
     @staticmethod
@@ -69,23 +76,30 @@ class CustomProvider(LLMProvider):
             return self._strip_gemini_prefix(model)
         return model
 
-    async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
-                   tool_choice: str = "auto",
-                   model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
-                   reasoning_effort: str | None = None) -> LLMResponse:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = "auto",
+    ) -> LLMResponse:
         started = time.perf_counter()
         requested_model = model or self.default_model
+
         kwargs: dict[str, Any] = {
             "model": self._resolve_model_name(requested_model),
             "messages": self._sanitize_empty_content(messages),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
+            "extra_headers": {"Connection": "close"},
         }
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
         if tools:
-            kwargs.update(tools=tools, tool_choice=tool_choice)
-        kwargs["extra_headers"] = {"Connection": "close"}
+            kwargs.update(tools=tools, tool_choice=tool_choice or "auto")
 
         attempts = 3
         for i in range(attempts):
@@ -173,6 +187,14 @@ class CustomProvider(LLMProvider):
         return LLMResponse(content="Error: Connection error.", finish_reason="error")
 
     def _parse(self, response: Any) -> LLMResponse:
+        if not response.choices:
+            return LLMResponse(
+                content=(
+                    "Error: API returned empty choices. This may indicate a temporary "
+                    "service issue or an invalid model response."
+                ),
+                finish_reason="error",
+            )
         choice = response.choices[0]
         msg = choice.message
         tool_calls: list[ToolCallRequest] = []
@@ -192,21 +214,32 @@ class CustomProvider(LLMProvider):
                 args = raw_args
                 raw_tc["function"]["arguments"] = json.dumps(raw_args, ensure_ascii=False)
 
-            tool_calls.append(ToolCallRequest(
-                id=str(raw_tc.get("id") or getattr(tc, "id", "")),
-                name=str(raw_tc.get("function", {}).get("name") or getattr(getattr(tc, "function", None), "name", "")),
-                arguments=args,
-                raw=raw_tc,
-            ))
+            tool_calls.append(
+                ToolCallRequest(
+                    id=str(raw_tc.get("id") or getattr(tc, "id", "")),
+                    name=str(
+                        raw_tc.get("function", {}).get("name")
+                        or getattr(getattr(tc, "function", None), "name", "")
+                    ),
+                    arguments=args,
+                    raw=raw_tc,
+                    provider_specific_fields=raw_tc.get("provider_specific_fields"),
+                    function_provider_specific_fields=raw_tc.get("function", {}).get("provider_specific_fields"),
+                )
+            )
         u = response.usage
         return LLMResponse(
-            content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
+            content=msg.content,
+            tool_calls=tool_calls,
+            finish_reason=choice.finish_reason or "stop",
             usage={
                 "prompt_tokens": u.prompt_tokens,
                 "completion_tokens": u.completion_tokens,
                 "total_tokens": u.total_tokens,
                 "cached_tokens": extract_cached_tokens(u),
-            } if u else {},
+            }
+            if u
+            else {},
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
 
